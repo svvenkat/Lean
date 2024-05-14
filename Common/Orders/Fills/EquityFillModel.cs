@@ -288,7 +288,11 @@ namespace QuantConnect.Orders.Fills
                     //-> 1.2 Buy Stop: If Price Above Setpoint, Buy:
                     if (prices.High > order.StopPrice || order.StopTriggered)
                     {
-                        order.StopTriggered = true;
+                        if (!order.StopTriggered)
+                        {
+                            order.StopTriggered = true;
+                            Parameters.OnOrderUpdated(order);
+                        }
 
                         // Fill the limit order, using closing price of bar:
                         // Note > Can't use minimum price, because no way to be sure minimum wasn't before the stop triggered.
@@ -306,7 +310,11 @@ namespace QuantConnect.Orders.Fills
                     //-> 1.1 Sell Stop: If Price below setpoint, Sell:
                     if (prices.Low < order.StopPrice || order.StopTriggered)
                     {
-                        order.StopTriggered = true;
+                        if (!order.StopTriggered)
+                        {
+                            order.StopTriggered = true;
+                            Parameters.OnOrderUpdated(order);
+                        }
 
                         // Fill the limit order, using minimum price of the bar
                         // Note > Can't use minimum price, because no way to be sure minimum wasn't before the stop triggered.
@@ -1038,25 +1046,6 @@ namespace QuantConnect.Orders.Fills
             }
 
             return new Prices(endTime, current, open, high, low, close);
-        }
-
-        /// <summary>
-        /// Determines if the exchange is open using the current time of the asset
-        /// </summary>
-        protected static bool IsExchangeOpen(Security asset, bool isExtendedMarketHours)
-        {
-            if (!asset.Exchange.DateTimeIsOpen(asset.LocalTime))
-            {
-                // if we're not open at the current time exactly, check the bar size, this handle large sized bars (hours/days)
-                var currentBar = asset.GetLastData();
-                if (currentBar == null
-                    || asset.LocalTime.Date != currentBar.EndTime.Date
-                    || !asset.Exchange.IsOpenDuringBar(currentBar.Time, currentBar.EndTime, isExtendedMarketHours))
-                {
-                    return false;
-                }
-            }
-            return true;
         }
     }
 }

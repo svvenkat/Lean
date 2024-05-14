@@ -30,7 +30,8 @@ namespace QuantConnect.Securities.Option
         // initial margin
         private const decimal OptionMarginRequirement = 1;
         private const decimal NakedPositionMarginRequirement = 0.1m;
-        private const decimal NakedPositionMarginRequirementOtm = 0.2m;
+        private const decimal EquityOptionNakedPositionMarginRequirementOtm = 0.2m;
+        private const decimal IndexOptionNakedPositionMarginRequirementOtm = 0.15m;
 
         /// <summary>
         /// Initializes a new instance of the <see cref="OptionMarginModel"/>
@@ -155,7 +156,11 @@ namespace QuantConnect.Securities.Option
             // inferring ratios of the option and its underlying to get underlying security value
             var multiplierRatio = underlying.SymbolProperties.ContractMultiplier / optionProperties.ContractMultiplier;
             var quantityRatio = optionProperties.ContractUnitOfTrade;
-            var priceRatio = underlying.Close / (absValue / quantityRatio);
+
+            // Some options are based on a fraction of their underlying security value, such as NQX for example. Thus,
+            // for them we need to scale the underlying value so that the later comparisons made with the option's strike
+            // value are correct
+            var priceRatio = (underlying.Close / option.SymbolProperties.StrikeMultiplier) / (absValue / quantityRatio);
             var underlyingValueRatio = multiplierRatio * quantityRatio * priceRatio;
 
             // calculating underlying security value less out-of-the-money amount
@@ -169,10 +174,13 @@ namespace QuantConnect.Securities.Option
             var nakedMarginRequirement = option.Right == OptionRight.Call
                 ? NakedPositionMarginRequirement * underlyingValueRatio
                 : NakedPositionMarginRequirement * strikePriceRatio;
+            var nakedMarginRequirementOtm = security.Type == SecurityType.Option
+                ? EquityOptionNakedPositionMarginRequirementOtm
+                : IndexOptionNakedPositionMarginRequirementOtm;
 
             return OptionMarginRequirement +
                    Math.Abs(quantity) * Math.Max(nakedMarginRequirement,
-                       NakedPositionMarginRequirementOtm * underlyingValueRatio - underlyingValueRatioOTM);
+                       nakedMarginRequirementOtm * underlyingValueRatio - underlyingValueRatioOTM);
         }
     }
 }

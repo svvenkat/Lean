@@ -19,6 +19,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Linq;
 using System.Threading;
+using Microsoft.CodeAnalysis;
 using Moq;
 using NodaTime;
 using NUnit.Framework;
@@ -72,6 +73,8 @@ namespace QuantConnect.Tests.Engine.DataFeeds
             Interlocked.Exchange(ref TestCustomData.ReaderCallsCount, 0);
             TestCustomData.ReturnNull = false;
             TestCustomData.ThrowException = false;
+
+            FundamentalService.Initialize(TestGlobals.DataProvider, new TestFundamentalDataProviderTrue(), false);
         }
 
         [TearDown]
@@ -81,6 +84,596 @@ namespace QuantConnect.Tests.Engine.DataFeeds
             _feed?.Exit();
             _synchronizer.DisposeSafely();
             _dataQueueHandler?.DisposeSafely();
+        }
+
+        [TestCase(SecurityType.Option, Resolution.Daily, 0)]
+        [TestCase(SecurityType.Future, Resolution.Daily, 0)]
+        [TestCase(SecurityType.Option, Resolution.Hour, 0)]
+        [TestCase(SecurityType.Future, Resolution.Hour, 0)]
+        [TestCase(SecurityType.Option, Resolution.Minute, 0)]
+        [TestCase(SecurityType.Future, Resolution.Minute, 0)]
+        [TestCase(SecurityType.Option, Resolution.Second, 0)]
+        [TestCase(SecurityType.Future, Resolution.Second, 0)]
+        [TestCase(SecurityType.Option, Resolution.Tick, 0)]
+        [TestCase(SecurityType.Future, Resolution.Tick, 0)]
+        [TestCase(SecurityType.Option, Resolution.Daily, 1)]
+        [TestCase(SecurityType.Future, Resolution.Daily, 1)]
+        [TestCase(SecurityType.Option, Resolution.Hour, 1)]
+        [TestCase(SecurityType.Future, Resolution.Hour, 1)]
+        [TestCase(SecurityType.Option, Resolution.Minute, 1)]
+        [TestCase(SecurityType.Future, Resolution.Minute, 1)]
+        [TestCase(SecurityType.Option, Resolution.Second, 1)]
+        [TestCase(SecurityType.Future, Resolution.Second, 1)]
+        [TestCase(SecurityType.Option, Resolution.Tick, 1)]
+        [TestCase(SecurityType.Future, Resolution.Tick, 1)]
+        public void LiveChainSelection(SecurityType securityType, Resolution resolution, int expirationDatesFilter)
+        {
+            _startDate = new DateTime(2014, 6, 9);
+            _manualTimeProvider.SetCurrentTimeUtc(_startDate);
+            var endDate = _startDate.AddDays(5);
+
+            _algorithm.SetBenchmark(x => 1);
+
+            var feed = RunDataFeed();
+
+            var selectionHappened = 0;
+            if (securityType == SecurityType.Option)
+            {
+                var chainAsset = _algorithm.AddOption("AAPL", resolution);
+                chainAsset.SetFilter(x =>
+                {
+                    selectionHappened++;
+                    var symbols = x.Expiration(0, expirationDatesFilter).IncludeWeeklys().OnlyApplyFilterAtMarketOpen().ToList();
+
+                    Assert.AreEqual(expirationDatesFilter + 1, symbols.Count(s => s.ID.OptionRight == OptionRight.Call));
+                    Assert.AreEqual(expirationDatesFilter + 1, symbols.Count(s => s.ID.OptionRight == OptionRight.Put));
+                    for (var i = 0; i < expirationDatesFilter; i++)
+                    {
+                        Assert.AreEqual(2, symbols.Count(s => s.ID.Date.Date == x.LocalTime.Date.AddDays(i)));
+                    }
+                    return x;
+                });
+            }
+            else
+            {
+                var chainAsset = _algorithm.AddFuture("ES", resolution);
+                chainAsset.SetFilter(x =>
+                {
+                    selectionHappened++;
+                    var symbols = x.Expiration(0, expirationDatesFilter).IncludeWeeklys().OnlyApplyFilterAtMarketOpen().ToList();
+
+                    Assert.AreEqual(expirationDatesFilter + 1, symbols.Count);
+                    for (var i = 0; i < expirationDatesFilter; i++)
+                    {
+                        Assert.AreEqual(1, symbols.Count(s => s.ID.Date.Date == x.LocalTime.Date.AddDays(i)));
+                    }
+                    return x;
+                });
+            }
+
+            // allow time for the exchange to pick up the selection point
+            Thread.Sleep(50);
+            ConsumeBridge(feed, TimeSpan.FromSeconds(5), true, ts => {
+                if (selectionHappened == 2)
+                {
+                    // we got what we wanted shortcut unit test
+                    _manualTimeProvider.SetCurrentTimeUtc(Time.EndOfTime);
+                }
+            },
+            endDate: endDate,
+            secondsTimeStep: 60 * 60 * 10);
+
+            Assert.AreEqual(2, selectionHappened);
+        }
+
+        [Test]
+        public void ContinuousFuturesImmediateSelection()
+        {
+            _startDate = new DateTime(2014, 6, 9);
+            var startDateUtc = _startDate.ConvertToUtc(_algorithm.TimeZone);
+            _manualTimeProvider.SetCurrentTimeUtc(startDateUtc);
+            var endDate = _startDate.AddDays(5);
+
+            _algorithm.SetBenchmark(x => 1);
+
+            var feed = RunDataFeed(runPostInitialize: false);
+
+            var esSelectionTime = DateTime.MinValue;
+            var esFuture = _algorithm.AddFuture("ES", Resolution.Minute, extendedMarketHours: true);
+            esFuture.SetFilter(x =>
+            {
+                esSelectionTime = x.LocalTime.ConvertToUtc(esFuture.Exchange.TimeZone);
+
+                Assert.IsNotEmpty(x);
+
+                return x;
+            });
+
+            // DC future time zone is Chicago while ES is New York, we need to assert that both selection happen right away
+            var dcSelectionTime = DateTime.MinValue;
+            var dcFuture = _algorithm.AddFuture("DC", Resolution.Minute, extendedMarketHours: true);
+            dcFuture.SetFilter(x =>
+            {
+                dcSelectionTime = x.LocalTime.ConvertToUtc(dcFuture.Exchange.TimeZone);
+
+                Assert.IsNotEmpty(x);
+
+                return x;
+            });
+
+            _algorithm.PostInitialize();
+
+            Assert.IsNull(esFuture.Mapped);
+            Assert.IsNull(dcFuture.Mapped);
+
+            // allow time for the exchange to pick up the selection point
+            Thread.Sleep(50);
+
+            var timeSliceCount = 0;
+            ConsumeBridge(feed, TimeSpan.FromSeconds(5), true, ts =>
+            {
+                timeSliceCount++;
+                if (esFuture.Mapped != null && dcFuture.Mapped != null)
+                {
+                    // we got what we wanted shortcut unit test
+                    _manualTimeProvider.SetCurrentTimeUtc(Time.EndOfTime);
+                }
+            },
+            endDate: endDate,
+            secondsTimeStep: 60 * 60);
+
+            // Continuous futures should select the first contract immediately
+            Assert.IsNotNull(esFuture.Mapped);
+            Assert.IsNotNull(dcFuture.Mapped);
+
+            Assert.AreEqual(startDateUtc, esSelectionTime);
+            Assert.AreEqual(startDateUtc, dcSelectionTime);
+
+            Assert.AreEqual(1, timeSliceCount);
+        }
+
+        [Test]
+        public void ETFsImmediateSelection()
+        {
+            _startDate = new DateTime(2020, 12, 1, 1, 0, 0);
+            var startDateUtc = _startDate.ConvertToUtc(_algorithm.TimeZone);
+            _manualTimeProvider.SetCurrentTimeUtc(startDateUtc);
+            var endDate = _startDate.AddDays(5);
+
+            _algorithm.SetBenchmark(x => 1);
+
+            var feed = RunDataFeed(runPostInitialize: false);
+
+            var spy = _algorithm.AddEquity("SPY").Symbol;
+
+            var selectionTime = DateTime.MinValue;
+            List<Symbol> constituents = null;
+
+            var universe = _algorithm.AddUniverse(_algorithm.Universe.ETF(spy, constituentsData =>
+            {
+                selectionTime = _algorithm.UtcTime;
+                constituents = constituentsData.Select(x => x.Symbol).ToList();
+                return constituents;
+            }));
+
+            _algorithm.PostInitialize();
+
+            // allow time for the exchange to pick up the selection point
+            Thread.Sleep(50);
+
+            var timeSliceCount = 0;
+            ConsumeBridge(feed, TimeSpan.FromSeconds(5), true, ts =>
+            {
+                timeSliceCount++;
+                if (selectionTime != DateTime.MinValue)
+                {
+                    // we got what we wanted shortcut unit test
+                    _manualTimeProvider.SetCurrentTimeUtc(Time.EndOfTime);
+                }
+            },
+            endDate: endDate,
+            secondsTimeStep: 60 * 60);
+
+            Assert.AreEqual(startDateUtc, selectionTime);
+            Assert.AreEqual(1, timeSliceCount);
+
+            Assert.IsNotNull(constituents);
+            Assert.IsNotEmpty(constituents);
+
+            CollectionAssert.AreEquivalent(constituents, universe.Members.Keys);
+
+            // The algorithm's security collection has all constituents and SPY (added manually)
+            constituents.Add(spy);
+            CollectionAssert.AreEquivalent(constituents, _algorithm.Securities.Keys);
+        }
+
+        [TestCase(true)]
+        [TestCase(false)]
+        public void FundamentalScheduleSelection(bool warmup)
+        {
+            _startDate = new DateTime(2014, 3, 27, 9, 0, 0);
+            var startDateUtc = _startDate.ConvertToUtc(_algorithm.TimeZone);
+            _manualTimeProvider.SetCurrentTimeUtc(startDateUtc);
+            var endDate = _startDate.AddDays(10);
+            _algorithm.SetStartDate(_startDate);
+
+            _algorithm.SetBenchmark(x => 1);
+            if (warmup)
+            {
+                _algorithm.SetWarmUp(TimeSpan.FromDays(2));
+            }
+            _algorithm.UniverseSettings.Schedule.On(_algorithm.DateRules.On(new DateTime(2014, 3, 24), new DateTime(2014, 3, 25),
+                new DateTime(2014, 3, 28), new DateTime(2014, 4, 3)));
+
+            var feed = RunDataFeed(runPostInitialize: false);
+
+            var selectionTime = DateTime.MinValue;
+
+            var selectionAlgoTime = new List<DateTime>();
+            var selectionDataTime = new List<DateTime>();
+            IEnumerable<Symbol> Filter(IEnumerable<Fundamental> fundamentals)
+            {
+                selectionAlgoTime.Add(_algorithm.Time.Date);
+                var dataPoint = fundamentals.Take(1);
+                selectionDataTime.Add(dataPoint.First().EndTime);
+                return dataPoint.Select(x => x.Symbol);
+            };
+
+            _algorithm.UniverseSettings.Resolution = Resolution.Daily;
+            var universe = _algorithm.AddUniverse(Filter);
+
+            _algorithm.PostInitialize();
+
+            // allow time for the exchange to pick up the selection point
+            Thread.Sleep(50);
+
+            ConsumeBridge(feed, TimeSpan.FromSeconds(500), true, ts =>
+            {
+                if (selectionTime != DateTime.MinValue)
+                {
+                    // we got what we wanted shortcut unit test
+                    _manualTimeProvider.SetCurrentTimeUtc(Time.EndOfTime);
+                }
+            },
+            endDate: endDate,
+            secondsTimeStep: 60 * 60 * 12);
+
+            Assert.AreEqual(3, selectionAlgoTime.Count, string.Join(",", selectionAlgoTime));
+            var index = 0;
+            if (warmup)
+            {
+                // warmup start time
+                Assert.AreEqual(new DateTime(2014, 3, 25), selectionAlgoTime[index++]);
+            }
+            else
+            {
+                // triggers right away, outside of schedule
+                Assert.AreEqual(new DateTime(2014, 3, 27), selectionAlgoTime[index++]);
+            }
+            Assert.AreEqual(new DateTime(2014, 3, 28), selectionAlgoTime[index++]);
+            Assert.AreEqual(new DateTime(2014, 4, 3), selectionAlgoTime[index++]);
+        }
+
+        [Test]
+        public void CoarseFundamentalsImmediateSelection()
+        {
+            _startDate = new DateTime(2014, 03, 26, 9, 0, 0);
+            var startDateUtc = _startDate.ConvertToUtc(_algorithm.TimeZone);
+            _manualTimeProvider.SetCurrentTimeUtc(startDateUtc);
+            var endDate = _startDate.AddDays(5);
+
+            _algorithm.SetBenchmark(x => 1);
+
+            var feed = RunDataFeed(runPostInitialize: false);
+
+            var selectionTime = DateTime.MinValue;
+            List<Symbol> selectedSymbols = null;
+
+            IEnumerable<Symbol> CoarseFilter(IEnumerable<CoarseFundamental> coarse)
+            {
+                selectionTime = _algorithm.UtcTime;
+                selectedSymbols = coarse.Select(x => x.Symbol).ToList();
+                return selectedSymbols;
+            };
+
+            _algorithm.UniverseSettings.Resolution = Resolution.Daily;
+            var universe = _algorithm.AddUniverse(CoarseFilter);
+
+            _algorithm.PostInitialize();
+
+            // allow time for the exchange to pick up the selection point
+            Thread.Sleep(50);
+
+            var timeSliceCount = 0;
+            ConsumeBridge(feed, TimeSpan.FromSeconds(5), true, ts =>
+            {
+                timeSliceCount++;
+                if (selectionTime != DateTime.MinValue)
+                {
+                    // we got what we wanted shortcut unit test
+                    _manualTimeProvider.SetCurrentTimeUtc(Time.EndOfTime);
+                }
+            },
+            endDate: endDate,
+            secondsTimeStep: 60 * 60);
+
+            Assert.AreEqual(startDateUtc, selectionTime);
+            Assert.AreEqual(1, timeSliceCount);
+
+            Assert.IsNotNull(selectedSymbols);
+            Assert.IsNotEmpty(selectedSymbols);
+            CollectionAssert.AreEquivalent(selectedSymbols, universe.Members.Keys);
+            CollectionAssert.AreEquivalent(selectedSymbols, _algorithm.Securities.Keys);
+        }
+
+        [Test]
+        public void FutureChainsImmediateSelection()
+        {
+            _startDate = new DateTime(2014, 6, 9);
+            var startDateUtc = _startDate.ConvertToUtc(_algorithm.TimeZone);
+            _manualTimeProvider.SetCurrentTimeUtc(startDateUtc);
+            var endDate = _startDate.AddDays(5);
+
+            _algorithm.SetBenchmark(x => 1);
+
+            var feed = RunDataFeed(runPostInitialize: false);
+
+            var firstSelectionTimeUtc = DateTime.MinValue;
+            List<Symbol> selectedSymbols = null;
+
+            var future = _algorithm.AddFuture("ES");
+            future.SetFilter(x =>
+            {
+                firstSelectionTimeUtc = x.LocalTime.ConvertToUtc(future.Exchange.TimeZone);
+                selectedSymbols = x.ToList();
+
+                return x;
+            });
+
+            _algorithm.PostInitialize();
+
+            // allow time for the exchange to pick up the selection point
+            Thread.Sleep(50);
+
+            var timeSliceCount = 0;
+            ConsumeBridge(feed, TimeSpan.FromSeconds(5), true, ts =>
+            {
+                timeSliceCount++;
+                if (firstSelectionTimeUtc != DateTime.MinValue)
+                {
+                    // we got what we wanted shortcut unit test
+                    _manualTimeProvider.SetCurrentTimeUtc(Time.EndOfTime);
+                }
+            },
+            endDate: endDate,
+            secondsTimeStep: 60 * 60);
+
+            Assert.AreEqual(startDateUtc, firstSelectionTimeUtc);
+            Assert.AreEqual(1, timeSliceCount);
+            Assert.IsNotNull(selectedSymbols);
+            Assert.IsNotEmpty(selectedSymbols);
+        }
+
+        [Test]
+        public void OptionChainImmediateSelection()
+        {
+            _startDate = new DateTime(2015, 12, 24, 11, 0, 0);
+            var startDateUtc = _startDate.ConvertToUtc(_algorithm.TimeZone);
+            _manualTimeProvider.SetCurrentTimeUtc(startDateUtc);
+            var endDate = _startDate.AddDays(5);
+
+            _algorithm.SetBenchmark(x => 1);
+
+            var feed = RunDataFeed(runPostInitialize: false);
+
+            var firstSelectionTimeUtc = DateTime.MinValue;
+            List<Symbol> selectedSymbols = null;
+
+            var selectionDone = false;
+
+            var option = _algorithm.AddOption("GOOG");
+            option.SetFilter(universe =>
+            {
+                selectionDone = true;
+                selectedSymbols = universe.ToList();
+
+                return universe;
+            });
+
+            _algorithm.PostInitialize();
+
+            // allow time for the exchange to pick up the selection point
+            Thread.Sleep(50);
+
+            var timeSliceCount = 0;
+            ConsumeBridge(feed, TimeSpan.FromSeconds(10), true, ts =>
+            {
+                timeSliceCount++;
+                if (selectionDone)
+                {
+                    // we got what we wanted shortcut unit test
+                    _manualTimeProvider.SetCurrentTimeUtc(Time.EndOfTime);
+                }
+            },
+            endDate: endDate,
+            secondsTimeStep: 60);
+
+            var expectedSelectionTimeUtc = startDateUtc.Add(option.Resolution.ToTimeSpan());
+
+            Assert.IsTrue(selectionDone);
+            Assert.GreaterOrEqual(timeSliceCount, 2);
+            Assert.IsNotNull(selectedSymbols);
+            Assert.IsNotEmpty(selectedSymbols);
+        }
+
+        [Test]
+        public void CustomUniverseImmediateSelection()
+        {
+            _startDate = new DateTime(2013, 10, 07);
+            var startDateUtc = _startDate.ConvertToUtc(_algorithm.TimeZone);
+            _manualTimeProvider.SetCurrentTimeUtc(startDateUtc);
+            var endDate = _startDate.AddDays(5);
+
+            _algorithm.SetBenchmark(x => 1);
+
+            var feed = RunDataFeed(runPostInitialize: false);
+
+            var selectionTime = DateTime.MinValue;
+
+            _algorithm.UniverseSettings.Resolution = Resolution.Daily;
+            var universe = _algorithm.AddUniverse(SecurityType.Equity,
+                "my-custom-universe",
+                Resolution.Daily,
+                Market.USA,
+                _algorithm.UniverseSettings,
+                time =>
+                {
+                    selectionTime = _algorithm.UtcTime;
+                    return new[] { "SPY", "GOOG", "APPL" };
+                });
+
+            _algorithm.PostInitialize();
+
+            // allow time for the exchange to pick up the selection point
+            Thread.Sleep(50);
+
+            var timeSliceCount = 0;
+            ConsumeBridge(feed, TimeSpan.FromSeconds(5), true, ts =>
+            {
+                timeSliceCount++;
+                if (selectionTime != DateTime.MinValue)
+                {
+                    // we got what we wanted shortcut unit test
+                    _manualTimeProvider.SetCurrentTimeUtc(Time.EndOfTime);
+                }
+            },
+            endDate: endDate,
+            secondsTimeStep: 60 * 60);
+
+            var expectedSymbols = new List<Symbol>()
+            {
+                Symbol.Create("SPY", SecurityType.Equity, Market.USA),
+                Symbol.Create("GOOG", SecurityType.Equity, Market.USA),
+                Symbol.Create("APPL", SecurityType.Equity, Market.USA)
+            };
+
+            Assert.AreEqual(startDateUtc, selectionTime);
+            Assert.AreEqual(1, timeSliceCount);
+
+            CollectionAssert.AreEquivalent(expectedSymbols, universe.Members.Keys);
+            CollectionAssert.AreEquivalent(expectedSymbols, _algorithm.Securities.Keys);
+        }
+
+        [Test]
+        public void CustomDataUniverseImmediateSelection()
+        {
+            _startDate = new DateTime(2014, 03, 26, 11, 0, 0);
+            var startDateUtc = _startDate.ConvertToUtc(_algorithm.TimeZone);
+            _manualTimeProvider.SetCurrentTimeUtc(startDateUtc);
+            var endDate = _startDate.AddDays(5);
+
+            _algorithm.SetBenchmark(x => 1);
+
+            var feed = RunDataFeed(runPostInitialize: false);
+
+            var selectionTime = DateTime.MinValue;
+            List<Symbol> selectedSymbols = null;
+
+            _algorithm.UniverseSettings.Resolution = Resolution.Daily;
+            var universe = _algorithm.AddUniverse<CoarseFundamental>("my-custom-coarse-universe", stockDataSource =>
+            {
+                selectionTime = _algorithm.UtcTime;
+                selectedSymbols = stockDataSource.Select(x => x.Symbol).ToList();
+
+                return selectedSymbols;
+            });
+
+            _algorithm.PostInitialize();
+
+            // allow time for the exchange to pick up the selection point
+            Thread.Sleep(50);
+
+            var timeSliceCount = 0;
+            ConsumeBridge(feed, TimeSpan.FromSeconds(5), true, ts =>
+            {
+                timeSliceCount++;
+                if (selectionTime != DateTime.MinValue)
+                {
+                    // we got what we wanted shortcut unit test
+                    _manualTimeProvider.SetCurrentTimeUtc(Time.EndOfTime);
+                }
+            },
+            endDate: endDate,
+            secondsTimeStep: 60 * 60);
+
+            Assert.AreEqual(startDateUtc, selectionTime);
+            Assert.AreEqual(1, timeSliceCount);
+
+            Assert.IsNotNull(selectedSymbols);
+            Assert.IsNotEmpty(selectedSymbols);
+            CollectionAssert.AreEquivalent(selectedSymbols, universe.Members.Keys);
+            CollectionAssert.AreEquivalent(selectedSymbols, _algorithm.Securities.Keys);
+        }
+
+        [Test]
+        public void ConstituentsImmediateSelection()
+        {
+            _startDate = new DateTime(2013, 10, 08);
+            var startDateUtc = _startDate.ConvertToUtc(_algorithm.TimeZone);
+            _manualTimeProvider.SetCurrentTimeUtc(startDateUtc);
+            var endDate = _startDate.AddDays(5);
+
+            _algorithm.SetBenchmark(x => 1);
+
+            var feed = RunDataFeed(runPostInitialize: false);
+
+            var selectionTime = DateTime.MinValue;
+            List<Symbol> constituents = null;
+
+            _algorithm.UniverseSettings.Resolution = Resolution.Daily;
+
+            var customUniverseSymbol = new Symbol(
+                SecurityIdentifier.GenerateConstituentIdentifier(
+                    "constituents-universe-qctest",
+                    SecurityType.Equity,
+                    Market.USA),
+                "constituents-universe-qctest");
+
+            var universe = _algorithm.AddUniverse(new ConstituentsUniverse(customUniverseSymbol, _algorithm.UniverseSettings, x =>
+            {
+                selectionTime = _algorithm.UtcTime;
+                constituents = x.Select(x => x.Symbol).ToList();
+
+                return constituents;
+
+            }));
+
+            _algorithm.PostInitialize();
+
+            // allow time for the exchange to pick up the selection point
+            Thread.Sleep(50);
+
+            var timeSliceCount = 0;
+            ConsumeBridge(feed, TimeSpan.FromSeconds(5), true, ts =>
+            {
+                timeSliceCount++;
+                if (selectionTime != DateTime.MinValue)
+                {
+                    // we got what we wanted shortcut unit test
+                    _manualTimeProvider.SetCurrentTimeUtc(Time.EndOfTime);
+                }
+            },
+            endDate: endDate,
+            secondsTimeStep: 60 * 60);
+
+            Assert.AreEqual(startDateUtc, selectionTime);
+            Assert.AreEqual(1, timeSliceCount);
+
+            Assert.IsNotNull(constituents);
+            Assert.IsNotEmpty(constituents);
+
+            CollectionAssert.AreEquivalent(constituents, universe.Members.Keys);
+            CollectionAssert.AreEquivalent(constituents, _algorithm.Securities.Keys);
         }
 
         [TestCase(false)]
@@ -129,9 +722,13 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                         _manualTimeProvider.SetCurrentTimeUtc(Time.EndOfTime);
                     }
                 }
+                if (_algorithm.IsWarmingUp)
+                {
+                    Thread.Sleep(10);
+                }
             },
             endDate: endDate,
-            secondsTimeStep: 60 * 60);
+            secondsTimeStep: 60 * 60 * 4);
 
             Assert.AreNotEqual(0, countWarmup);
             Assert.AreNotEqual(0, countLive);
@@ -165,16 +762,16 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                 // let's wait till it's remapped
                 if (securityChanges == 3)
                 {
-                    Assert.IsNotNull(_algorithm.Securities.Values.SingleOrDefault(sec => sec.IsTradable));
-                    Assert.AreEqual(3, _algorithm.Securities.Values.Count);
+                    Assert.IsNotNull(_algorithm.Securities.Total.SingleOrDefault(sec => sec.IsTradable));
+                    Assert.AreEqual(3, _algorithm.Securities.Total.Count);
 
-                    var result = LiveTradingResultHandler.GetHoldings(_algorithm.Securities.Values, _algorithm.SubscriptionManager.SubscriptionDataConfigService);
+                    var result = LiveTradingResultHandler.GetHoldings(_algorithm.Securities.Total, _algorithm.SubscriptionManager.SubscriptionDataConfigService);
                     // old future mapped contract is removed
                     Assert.AreEqual(2, result.Count);
                     Assert.IsTrue(result.TryGetValue(es.Symbol.ID.ToString(), out var holding));
                     Assert.IsTrue(result.TryGetValue(es.Mapped.ID.ToString(), out holding));
 
-                    Assert.AreEqual(0, LiveTradingResultHandler.GetHoldings(_algorithm.Securities.Values, _algorithm.SubscriptionManager.SubscriptionDataConfigService, onlyInvested: true).Count);
+                    Assert.AreEqual(0, LiveTradingResultHandler.GetHoldings(_algorithm.Securities.Total, _algorithm.SubscriptionManager.SubscriptionDataConfigService, onlyInvested: true).Count);
 
                     _algorithm.RemoveSecurity(es.Symbol);
                     // allow time for the exchange to pick up the selection point
@@ -182,10 +779,10 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                 }
                 else if (securityChanges == 4)
                 {
-                    Assert.IsTrue(_algorithm.Securities.Values.All(sec => !sec.IsTradable));
-                    Assert.AreEqual(3, _algorithm.Securities.Values.Count);
+                    Assert.IsTrue(_algorithm.Securities.Total.All(sec => !sec.IsTradable));
+                    Assert.AreEqual(3, _algorithm.Securities.Total.Count);
 
-                    var result = LiveTradingResultHandler.GetHoldings(_algorithm.Securities.Values, _algorithm.SubscriptionManager.SubscriptionDataConfigService);
+                    var result = LiveTradingResultHandler.GetHoldings(_algorithm.Securities.Total, _algorithm.SubscriptionManager.SubscriptionDataConfigService);
                     Assert.AreEqual(0, result.Count);
 
                     // we got what we wanted shortcut unit test
@@ -294,7 +891,78 @@ namespace QuantConnect.Tests.Engine.DataFeeds
 
         [TestCase(false)]
         [TestCase(true)]
-        public void WarmupExpiredAsset(bool useWarmupResolution)
+        public void WarmupExpiredContinuousFuture(bool useWarmupResolution)
+        {
+            _startDate = new DateTime(2014, 12, 1);
+            _manualTimeProvider.SetCurrentTimeUtc(_startDate);
+
+            var endDate = _startDate.AddDays(30);
+            _algorithm.SetFutureChainProvider(new BacktestingFutureChainProvider(TestGlobals.DataCacheProvider));
+            _algorithm.UniverseSettings.Resolution = Resolution.Daily;
+            if (useWarmupResolution)
+            {
+                _algorithm.SetWarmup(365, Resolution.Daily);
+            }
+            else
+            {
+                _algorithm.SetWarmup(TimeSpan.FromDays(365));
+            }
+            var feed = RunDataFeed(runPostInitialize: false);
+
+            var continuousContract = _algorithm.AddFuture(Futures.Indices.SP500EMini, Resolution.Daily,
+                dataNormalizationMode: DataNormalizationMode.BackwardsRatio,
+                dataMappingMode: DataMappingMode.LastTradingDay,
+                contractDepthOffset: 0
+            );
+            // the expiration of this option contract is before the start date of the algorithm but we should still get some data during warmup
+            continuousContract.SetFilter(0, 182);
+
+            // Post initialize after securities are added (Initialize)
+            _algorithm.PostInitialize();
+
+            var emittedChainData = false;
+            var emittedContinuousData = false;
+            var assertedSubscriptions = false;
+            ConsumeBridge(feed, TimeSpan.FromSeconds(5), true, ts =>
+            {
+                if (_algorithm.IsWarmingUp)
+                {
+                    Assert.IsFalse(_dataQueueHandler.SubscriptionDataConfigs.Any(
+                        // the data queue handler shouldn't of seen the expired subscription at any point
+                        x => !x.Symbol.IsCanonical() && x.Symbol.SecurityType == SecurityType.Future && x.Symbol.ID.Date < _algorithm.StartDate));
+
+                    if (ts.Slice.HasData)
+                    {
+                        emittedContinuousData |= ts.Slice.Keys.Any(s => s == continuousContract.Symbol
+                            // let's assert that during warmup the continuous future got data of expired future
+                            && continuousContract.Mapped.ID.Date < _algorithm.StartDate);
+                        emittedChainData |= ts.Slice.Keys.Any(s => !s.IsCanonical() && s.SecurityType == SecurityType.Future
+                            // let's assert that during warmup we got chain data of expired futures
+                            && s.ID.Date < _algorithm.StartDate);
+                    }
+                }
+                else
+                {
+                    Assert.IsTrue(_dataQueueHandler.SubscriptionDataConfigs.Any(
+                        // the data queue handler should of seen the Non expired subscription at any point
+                        x => !x.Symbol.IsCanonical() && x.Symbol.SecurityType == SecurityType.Future && x.Symbol.ID.Date >= _algorithm.StartDate));
+
+                    assertedSubscriptions = true;
+                    // we got what we wanted shortcut unit test
+                    _manualTimeProvider.SetCurrentTimeUtc(Time.EndOfTime);
+                }
+            },
+            endDate: endDate,
+            secondsTimeStep: 60);
+
+            Assert.IsTrue(assertedSubscriptions);
+            Assert.IsTrue(emittedContinuousData);
+            Assert.IsTrue(emittedChainData);
+        }
+
+        [TestCase(false)]
+        [TestCase(true)]
+        public void WarmupExpiredOption(bool useWarmupResolution)
         {
             _startDate = new DateTime(2014, 6, 14);
             _manualTimeProvider.SetCurrentTimeUtc(_startDate);
@@ -311,8 +979,6 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                 _algorithm.SetWarmup(TimeSpan.FromDays(10));
             }
             var feed = RunDataFeed();
-            // after algorithm initialization let's set the time provider time to reflect warmup window
-            _manualTimeProvider.SetCurrentTimeUtc(_algorithm.UtcTime);
 
             var aapl = _algorithm.AddEquity("AAPL");
             // the expiration of this option contract is before the start date of the algorithm but we should still get some data during warmup
@@ -322,6 +988,9 @@ namespace QuantConnect.Tests.Engine.DataFeeds
             var emittedData = false;
             ConsumeBridge(feed, TimeSpan.FromSeconds(5), true, ts =>
             {
+                // the data queue handler shouldn't of seen the expired option subscription at any point
+                Assert.IsFalse(_dataQueueHandler.SubscriptionDataConfigs.Any(x => !x.Symbol.IsCanonical() && x.Symbol.SecurityType.IsOption()));
+
                 if (ts.Slice.HasData)
                 {
                     if (_algorithm.IsWarmingUp && ts.Slice.Keys.Any(s => s == option))
@@ -412,6 +1081,9 @@ namespace QuantConnect.Tests.Engine.DataFeeds
             var forex = new List<string> { "EURUSD", "USDJPY", "GBPJPY", "AUDUSD", "NZDUSD" };
 
             var feed = RunDataFeed(equities: equities, forex: forex);
+
+            // allow the feed to create a data point for all
+            Thread.Sleep(25);
 
             var emittedData = false;
             ConsumeBridge(feed, TimeSpan.FromSeconds(2), ts =>
@@ -513,8 +1185,8 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                     {
                         Assert.IsTrue(ts.Slice.Keys.Contains(Symbols.SPY));
                     }
-                    // SPY benchmark and the UserDefinedUniverse
-                    Assert.AreEqual(2, _dataQueueHandler.Subscriptions.Count);
+                    // SPY benchmark
+                    Assert.AreEqual(1, _dataQueueHandler.Subscriptions.Count);
 
                     _algorithm.AddSecurities(forex: new List<string> { "EURUSD" });
                     emittedData = true;
@@ -527,8 +1199,8 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                 }
                 else
                 {
-                    // SPY benchmark and the UserDefinedUniverse Equity/Forex, EURUSD
-                    if (_dataQueueHandler.Subscriptions.Count == 4) // there could be some slices with no data
+                    // SPY benchmark and EURUSD
+                    if (_dataQueueHandler.Subscriptions.Count == 2) // there could be some slices with no data
                     {
                         Assert.IsTrue(_dataQueueHandler.Subscriptions.Contains(Symbols.SPY));
                         if (ts.Data.Count > 0)
@@ -579,8 +1251,8 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                 securityChanges += ts.SecurityChanges.Count;
                 if (!firstTime)
                 {
-                    // benchmark SPY, EURUSD and the UserDefinedUniverse
-                    Assert.AreEqual(3, _dataQueueHandler.Subscriptions.Count);
+                    // benchmark SPY, EURUSD
+                    Assert.AreEqual(2, _dataQueueHandler.Subscriptions.Count);
                     _algorithm.AddUniverse("TestUniverse", time => new List<string> { "AAPL", "SPY" });
                     firstTime = true;
                 }
@@ -590,7 +1262,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                     {
                         Assert.AreEqual(1, _dataQueueHandler.Subscriptions.Count(x => x.Value.Contains("TESTUNIVERSE")));
                     }
-                    else if (_dataQueueHandler.Subscriptions.Count == 4)
+                    else if (_dataQueueHandler.Subscriptions.Count == 3)
                     {
                         // Coarse universe isn't added to the data queue handler
                         Assert.AreNotEqual(1, _dataQueueHandler.Subscriptions.Count(x => x.Value.Contains("TESTUNIVERSE")));
@@ -637,6 +1309,8 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                 if (ts.SecurityChanges != SecurityChanges.None)
                 {
                     changes.Add(ts.SecurityChanges);
+                    Thread.Sleep(100);
+                    return;
                 }
                 if (!emittedData)
                 {
@@ -645,20 +1319,21 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                     {
                         Assert.IsTrue(ts.Slice.Keys.Contains(Symbols.SPY));
                     }
-                    // SPY benchmark and the UserDefinedUniverse
-                    Assert.AreEqual(2, _dataQueueHandler.Subscriptions.Count);
+                    // SPY benchmark
+                    Assert.AreEqual(1, _dataQueueHandler.Subscriptions.Count);
 
                     _algorithm.AddSecurities(equities: new List<string> { "AAPL" });
+                    _algorithm.OnEndOfTimeStep();
                     emittedData = true;
 
                     // The custom exchange has to pick up the universe selection data point and push it into the universe subscription to
                     // trigger adding AAPL in the next loop
-                    Thread.Sleep(150);
+                    Thread.Sleep(100);
                 }
                 else
                 {
-                    // SPY benchmark and the UserDefinedUniverse Equity, AAPL
-                    if (_dataQueueHandler.Subscriptions.Count == 3) // there could be some slices with no data
+                    // SPY benchmark and AAPL
+                    if (_dataQueueHandler.Subscriptions.Count == 2) // there could be some slices with no data
                     {
                         Assert.IsTrue(_dataQueueHandler.Subscriptions.Contains(Symbols.SPY));
                         if (ts.Data.Count > 0)
@@ -721,13 +1396,13 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                 else
                 {
                     // should of remove trade and quote bar subscription for both (4)
-                    Assert.AreEqual(currentSubscriptionCount - 4, _dataQueueHandler.SubscriptionDataConfigs.Count);
+                    Assert.AreEqual(currentSubscriptionCount - 2, _dataQueueHandler.SubscriptionDataConfigs.Count);
                     // internal subscription should still be there
                     Assert.AreEqual(0, _dataQueueHandler.SubscriptionDataConfigs
                         .Where(config => !config.IsInternalFeed)
                         .Count(config => config.Symbol == Symbols.SPY));
-                    // Should be 2 left because of internal subscription trade/quote
-                    Assert.AreEqual(2, _dataQueueHandler.SubscriptionDataConfigs.Count(config => config.Symbol == Symbols.SPY));
+                    // Should be 1 left because of internal subscription trade hour
+                    Assert.AreEqual(1, _dataQueueHandler.SubscriptionDataConfigs.Count(config => config.Symbol == Symbols.SPY));
                     Assert.IsTrue(_dataQueueHandler.Subscriptions.Contains(Symbols.EURUSD));
 
                     // we got what we wanted shortcut unit test
@@ -769,13 +1444,13 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                 else
                 {
                     // should of remove trade and quote bar subscription for both (4)
-                    Assert.AreEqual(currentSubscriptionCount - 4, _dataQueueHandler.SubscriptionDataConfigs.Count);
+                    Assert.AreEqual(currentSubscriptionCount - 2, _dataQueueHandler.SubscriptionDataConfigs.Count);
                     // internal subscription should still be there
                     Assert.AreEqual(0, _dataQueueHandler.SubscriptionDataConfigs
                         .Where(config => !config.IsInternalFeed)
                         .Count(config => config.Symbol == Symbols.SPY));
-                    // Should be 2 left because of internal subscription trade/quote
-                    Assert.AreEqual(2, _dataQueueHandler.SubscriptionDataConfigs.Count(config => config.Symbol == Symbols.SPY));
+                    // Should be 1 left because of internal subscription trade hour
+                    Assert.AreEqual(1, _dataQueueHandler.SubscriptionDataConfigs.Count(config => config.Symbol == Symbols.SPY));
                     Assert.IsTrue(_dataQueueHandler.Subscriptions.Contains(Symbols.EURUSD));
                     // we got what we wanted shortcut unit test
                     _manualTimeProvider.SetCurrentTimeUtc(Time.EndOfTime);
@@ -803,7 +1478,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                 averages.Add(avg);
             }, null, Time.OneSecond, Time.OneSecond);
 
-            ConsumeBridge(feed, TimeSpan.FromSeconds(5), false, ts =>
+            ConsumeBridge(feed, TimeSpan.FromSeconds(3), false, ts =>
             {
                 Interlocked.Add(ref ticks, ts.Slice.Ticks.Sum(x => x.Value.Count));
             });
@@ -821,7 +1496,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
 
             var emittedData = false;
             var lastTime = DateTime.UtcNow;
-            ConsumeBridge(feed, TimeSpan.FromSeconds(5), ts =>
+            ConsumeBridge(feed, TimeSpan.FromSeconds(3), ts =>
             {
                 if (!emittedData)
                 {
@@ -896,9 +1571,14 @@ namespace QuantConnect.Tests.Engine.DataFeeds
 
             TestCustomData.ReturnNull = returnsNull;
             TestCustomData.ThrowException = throwsException;
-            ConsumeBridge(feed, TimeSpan.FromSeconds(2), false, ts =>
+            ConsumeBridge(feed, TimeSpan.FromSeconds(2), alwaysInvoke: true, ts =>
             {
-                Log.Trace("Emitted data");
+                // we request every 30min, so let's make sure time doesn't advance beyond 30 min, we want to test we are not requesting in a tight loop in the data stack
+                Thread.Sleep(100);
+                if (ts.DataPointCount > 0)
+                {
+                    Log.Debug("Emitted data");
+                }
             });
 
             Assert.AreEqual(1, TestCustomData.ReaderCallsCount);
@@ -1078,21 +1758,14 @@ namespace QuantConnect.Tests.Engine.DataFeeds
         [Test]
         public void DelistedEventEmitted_Equity()
         {
-            _startDate = new DateTime(2016, 2, 18, 6, 0, 0);
+            _startDate = new DateTime(2007, 05, 17);
             CustomMockedFileBaseData.StartDate = _startDate;
             _manualTimeProvider.SetCurrentTimeUtc(_startDate);
-            var delistingDate = _startDate.Date.AddDays(1);
 
-            var autoResetEvent = new AutoResetEvent(false);
-            var feed = RunDataFeed(getNextTicksFunction: handler =>
-            {
-                autoResetEvent.Set();
-                return new[] { new Delisting(Symbols.AAPL, delistingDate, 1, DelistingType.Warning) };
-            });
-            _algorithm.AddEquity(Symbols.AAPL);
+            var feed = RunDataFeed();
+            var symbol = _algorithm.AddEquity("AAA.1").Symbol;
             _algorithm.OnEndOfTimeStep();
             _algorithm.SetFinishedWarmingUp();
-            Assert.IsTrue(autoResetEvent.WaitOne(TimeSpan.FromMilliseconds(200)));
 
             var receivedDelistedWarning = 0;
             var receivedDelisted = 0;
@@ -1100,7 +1773,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
             {
                 foreach (var delistingEvent in ts.Slice.Delistings)
                 {
-                    if (delistingEvent.Key != Symbols.AAPL)
+                    if (delistingEvent.Key != symbol)
                     {
                         throw new Exception($"Unexpected delisting for symbol {delistingEvent.Key}");
                     }
@@ -1119,7 +1792,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
             },
             alwaysInvoke: false,
             secondsTimeStep: 3600 * 8,
-            endDate: delistingDate.AddDays(2));
+            endDate: _startDate.AddDays(3));
 
             Assert.AreEqual(1, receivedDelistedWarning, $"Did not receive {DelistingType.Warning}");
             Assert.AreEqual(1, receivedDelisted, $"Did not receive {DelistingType.Delisted}");
@@ -1134,7 +1807,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
             _manualTimeProvider.SetCurrentTimeUtc(_startDate);
             var feed = RunDataFeed();
 
-            _algorithm.AddOptionContract(Symbols.SPY_C_192_Feb19_2016);
+            var option = _algorithm.AddOptionContract(Symbols.SPY_C_192_Feb19_2016);
             _algorithm.OnEndOfTimeStep();
             _algorithm.SetFinishedWarmingUp();
 
@@ -1167,10 +1840,14 @@ namespace QuantConnect.Tests.Engine.DataFeeds
 
             Assert.AreEqual(1, receivedDelistedWarning, $"Did not receive {DelistingType.Warning}");
             Assert.AreEqual(1, receivedDelisted, $"Did not receive {DelistingType.Delisted}");
+
+            Assert.IsTrue(option.IsDelisted);
+            Assert.IsFalse(option.IsTradable);
+            Assert.IsFalse(_algorithm.Securities.Any(x => x.Key == option.Symbol));
         }
 
         [TestCase("20140325", typeof(CoarseFundamental))]
-        [TestCase("20201202", typeof(ETFConstituentData))]
+        [TestCase("20201202", typeof(ETFConstituentUniverse))]
         public void UniverseDataIsHoldUntilTimeIsRight(string dateTime, Type universeData)
         {
             _startDate = Time.ParseDate(dateTime);
@@ -1196,7 +1873,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
             ConsumeBridge(feed, TimeSpan.FromSeconds(5), ts =>
             {
                 if (ts.UniverseData.Count > 0 &&
-                    ts.UniverseData.First().Value.Data.First().GetType() == universeData)
+                    ts.UniverseData.First().Value.Data.First().GetType().IsAssignableTo(universeData))
                 {
                     var now = _manualTimeProvider.GetUtcNow();
                     Log.Trace($"Received BaseDataCollection {now}");
@@ -1254,7 +1931,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
             ConsumeBridge(feed, TimeSpan.FromSeconds(10), ts =>
             {
                 if (ts.UniverseData.Count > 0 &&
-                    ts.UniverseData.First().Value.Data.First() is Fundamentals)
+                    ts.UniverseData.First().Value.Data.First() is Fundamental)
                 {
                     securityChanges = ts.SecurityChanges;
                     receivedFundamentalsData = true;
@@ -1318,7 +1995,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
             ConsumeBridge(feed, TimeSpan.FromSeconds(5), ts =>
             {
                 if (ts.UniverseData.Count > 0 &&
-                    ts.UniverseData.First().Value.Data.First() is Fundamentals)
+                    ts.UniverseData.First().Value.Data.First() is Fundamental)
                 {
                     if (_algorithm.IsWarmingUp)
                     {
@@ -1399,7 +2076,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
             ConsumeBridge(feed, TimeSpan.FromSeconds(5), ts =>
             {
                 if (ts.UniverseData.Count > 0 &&
-                    ts.UniverseData.First().Value.Data.First() is Fundamentals)
+                    ts.UniverseData.First().Value.Data.First() is Fundamental)
                 {
                     receivedFundamentalsData = true;
                     // we got what we wanted shortcut unit test
@@ -1503,6 +2180,25 @@ namespace QuantConnect.Tests.Engine.DataFeeds
         }
 
         [Test]
+        public void ThrowingDataQueueHandlerRuntimeError()
+        {
+            _algorithm.UniverseSettings.Resolution = Resolution.Daily;
+            _algorithm.Transactions.SetOrderProcessor(new FakeOrderProcessor());
+            var feed = RunDataFeed(dataQueueHandler: new ThrowingDataQueueHandler());
+
+            _algorithm.AddEquity("SPY");
+            _algorithm.OnEndOfTimeStep();
+            ConsumeBridge(feed, TimeSpan.FromSeconds(2), ts => {
+                if (_algorithm.Status == AlgorithmStatus.RuntimeError)
+                {
+                    _manualTimeProvider.SetCurrentTimeUtc(Time.EndOfTime);
+                }
+            }, secondsTimeStep: 60 * 60 * 3);
+
+            Assert.AreEqual(AlgorithmStatus.RuntimeError, _algorithm.Status);
+        }
+
+        [Test]
         public void FastExitsDoNotThrowUnhandledExceptions()
         {
             var algorithm = new AlgorithmStub();
@@ -1524,11 +2220,10 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                 algorithm,
                 RegisteredSecurityDataTypesProvider.Null,
                 new SecurityCacheProvider(algorithm.Portfolio));
-            var fileProvider = new DefaultDataProvider();
             algorithm.Securities.SetSecurityService(securityService);
             var dataPermissionManager = new DataPermissionManager();
             var dataManager = new DataManager(_feed,
-                new UniverseSelection(algorithm, securityService, dataPermissionManager, fileProvider),
+                new UniverseSelection(algorithm, securityService, dataPermissionManager, TestGlobals.DataProvider),
                 algorithm,
                 algorithm.TimeKeeper,
                 marketHoursDatabase,
@@ -1548,7 +2243,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                 resultHandler,
                 TestGlobals.MapFileProvider,
                 TestGlobals.FactorFileProvider,
-                fileProvider,
+                TestGlobals.DataProvider,
                 dataManager,
                 _synchronizer,
                 new TestDataChannelProvider());
@@ -1571,7 +2266,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
         [Test]
         public void HandlesAllTickTypesAtTickResolution()
         {
-            var symbol = Symbol.Create("BTCUSD", SecurityType.Crypto, Market.GDAX);
+            var symbol = Symbol.Create("BTCUSD", SecurityType.Crypto, Market.Coinbase);
             // setting func benchmark so we don't add SPY
             _algorithm.SetBenchmark(time => 1);
             var feed = RunDataFeed(
@@ -1901,7 +2596,8 @@ namespace QuantConnect.Tests.Engine.DataFeeds
         private IDataFeed RunDataFeed(Resolution resolution = Resolution.Second, List<string> equities = null, List<string> forex = null, List<string> crypto = null,
             Func<FuncDataQueueHandler, IEnumerable<BaseData>> getNextTicksFunction = null,
             Func<Symbol, bool, string, IEnumerable<Symbol>> lookupSymbolsFunction = null,
-            Func<bool> canPerformSelection = null)
+            Func<bool> canPerformSelection = null, IDataQueueHandler dataQueueHandler = null,
+            bool runPostInitialize = true)
         {
             _algorithm.SetStartDate(_startDate);
             _algorithm.SetDateTime(_manualTimeProvider.GetUtcNow());
@@ -1938,16 +2634,32 @@ namespace QuantConnect.Tests.Engine.DataFeeds
             _dataQueueHandler = new FuncDataQueueHandlerUniverseProvider(getNextTicksFunction,
                 lookupSymbolsFunction ?? ((symbol, _, _) =>
                 {
-                    return new List<Symbol> { Symbol.CreateOption(symbol.Underlying ?? symbol,
-                        symbol.ID.Market,
-                        symbol.SecurityType.DefaultOptionStyle(),
-                        OptionRight.Call,
-                        1,
-                        _manualTimeProvider.GetUtcNow().AddDays(10))};
+                    var date = _manualTimeProvider.GetUtcNow().Date;
+                    var symbols = new List<Symbol>();
+                    for (var i = 0; i < 4; i++)
+                    {
+                        if (symbol.SecurityType.IsOption())
+                        {
+                            foreach (var optionRight in new[] { OptionRight.Call, OptionRight.Put })
+                            {
+                                symbols.Add(Symbol.CreateOption(symbol.Underlying ?? symbol,
+                                    symbol.ID.Market,
+                                    symbol.SecurityType.DefaultOptionStyle(),
+                                    optionRight,
+                                    i,
+                                    date.AddDays(i)));
+                            }
+                        }
+                        else
+                        {
+                            symbols.Add(Symbol.CreateFuture(symbol.ID.Symbol, symbol.ID.Market, date.AddDays(i)));
+                        }
+                    }
+                    return symbols;
                 }),
                 canPerformSelection ?? (() => true), _manualTimeProvider);
 
-            _feed = new TestableLiveTradingDataFeed(_dataQueueHandler);
+            _feed = new TestableLiveTradingDataFeed(dataQueueHandler ?? _dataQueueHandler);
             var fileProvider = TestGlobals.DataProvider;
             var marketHoursDatabase = MarketHoursDatabase.FromDataFolder();
             var symbolPropertiesDataBase = SymbolPropertiesDatabase.FromDataFolder();
@@ -1964,13 +2676,17 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                 dataPermissionManager);
             _algorithm.SubscriptionManager.SetDataManager(_dataManager);
             _algorithm.AddSecurities(resolution, equities, forex, crypto);
-            _synchronizer = new TestableLiveSynchronizer(_manualTimeProvider, 500);
+            _synchronizer = new TestableLiveSynchronizer(_manualTimeProvider, 10);
             _synchronizer.Initialize(_algorithm, _dataManager);
 
             _feed.Initialize(_algorithm, job, resultHandler, TestGlobals.MapFileProvider,
                 TestGlobals.FactorFileProvider, fileProvider, _dataManager, _synchronizer, new TestDataChannelProvider());
 
-            _algorithm.PostInitialize();
+            if (runPostInitialize)
+            {
+                _algorithm.PostInitialize();
+            }
+
             return _feed;
         }
 
@@ -2127,8 +2843,8 @@ namespace QuantConnect.Tests.Engine.DataFeeds
             new TestCaseData(Symbol.CreateBase(typeof(IndexedLinkedData2), Symbols.AAPL, Market.USA), Resolution.Tick, 1, 0, 0, 0, 0, 24, true, _instances[typeof(IndexedLinkedData2)]),
 
             //// Custom data streamed
-            new TestCaseData(Symbol.CreateBase(typeof(IndexedLinkedData), Symbols.AAPL, Market.USA), Resolution.Hour, 1, 0, 0, 0, 0, 24 * 2, false, _instances[typeof(IndexedLinkedData)]),
-            new TestCaseData(Symbol.CreateBase(typeof(IndexedLinkedData), Symbols.AAPL, Market.USA), Resolution.Minute, 1, 0, 0, 0, 0, 60 * 2, false, _instances[typeof(IndexedLinkedData)]),
+            new TestCaseData(Symbol.CreateBase(typeof(IndexedLinkedData), Symbols.AAPL, Market.USA), Resolution.Hour, 1, 0, 0, 0, 0, 24, false, _instances[typeof(IndexedLinkedData)]),
+            new TestCaseData(Symbol.CreateBase(typeof(IndexedLinkedData), Symbols.AAPL, Market.USA), Resolution.Minute, 1, 0, 0, 0, 0, 60, false, _instances[typeof(IndexedLinkedData)]),
             new TestCaseData(Symbol.CreateBase(typeof(IndexedLinkedData), Symbols.AAPL, Market.USA), Resolution.Tick, 1, 0, 0, 0, 0, 24, false, _instances[typeof(IndexedLinkedData)])
         };
 
@@ -2197,13 +2913,13 @@ namespace QuantConnect.Tests.Engine.DataFeeds
 
                 if (symbol.SecurityType == SecurityType.Base)
                 {
-                    BaseData dataPoint = null;
-                    dataPoints.Add(new T
+                    var dataPoint = new T
                     {
                         Symbol = symbol,
                         EndTime = exchangeTime,
                         Value = actualPricePointsEnqueued++
-                    });
+                    };
+                    dataPoints.Add(dataPoint);
 
                     ConsoleWriteLine(
                         $"{algorithmTime} - FuncDataQueueHandler emitted custom data point: {dataPoint}");
@@ -2288,7 +3004,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
             mock.Setup(m => m.GetOpenOrders(It.IsAny<Func<Order, bool>>())).Returns(new List<Order>());
             algorithm.Transactions.SetOrderProcessor(mock.Object);
 
-            _synchronizer = new TestableLiveSynchronizer(timeProvider, 150);
+            _synchronizer = new TestableLiveSynchronizer(timeProvider, 10);
             _synchronizer.Initialize(algorithm, dataManager);
 
             Security security;
@@ -2342,16 +3058,16 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                     advanceTimeSpan = TimeSpan.FromHours(1);
                     break;
                 case Resolution.Second:
-                    advanceTimeSpan = TimeSpan.FromSeconds(0.5);
+                    advanceTimeSpan = TimeSpan.FromSeconds(1);
                     break;
                 case Resolution.Minute:
-                    advanceTimeSpan = TimeSpan.FromSeconds(30);
+                    advanceTimeSpan = TimeSpan.FromSeconds(60);
                     break;
                 case Resolution.Hour:
-                    advanceTimeSpan = TimeSpan.FromMinutes(30);
+                    advanceTimeSpan = TimeSpan.FromMinutes(60);
                     break;
                 case Resolution.Daily:
-                    advanceTimeSpan = TimeSpan.FromHours(12);
+                    advanceTimeSpan = TimeSpan.FromHours(24);
                     break;
             }
             try
@@ -2368,11 +3084,9 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                     if (timeSlice.IsTimePulse)
                     {
                         algorithm.OnEndOfTimeStep();
+                        exchangeTimeZone = security.Exchange.TimeZone;
                         continue;
                     }
-
-                    exchangeTimeZone = security.Exchange.TimeZone;
-
                     sliceCount++;
 
                     // give enough time to the producer to emit
@@ -2474,6 +3188,19 @@ namespace QuantConnect.Tests.Engine.DataFeeds
 
                     ConsoleWriteLine($"Algorithm time set to {currentTime.ConvertFromUtc(algorithmTimeZone)}");
 
+                    if (shouldThrowException && algorithm.Status == AlgorithmStatus.RuntimeError)
+                    {
+                        // expected
+                        return;
+                    }
+
+                    if (currentTime.ConvertFromUtc(algorithmTimeZone) > endDate)
+                    {
+                        _feed.Exit();
+                        cancellationTokenSource.Cancel();
+                        break;
+                    }
+
                     if (resolution != Resolution.Tick)
                     {
                         var amount = currentTime.Ticks % resolution.ToTimeSpan().Ticks;
@@ -2482,20 +3209,16 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                             // let's avoid race conditions and give time for the funDataQueueHandler thread to distribute the data among the consolidators
                             if (!_synchronizer.NewDataEvent.Wait(500))
                             {
-                                Assert.Fail("Timeout waiting for data generation");
+                                if (!shouldThrowException || algorithm.Status != AlgorithmStatus.RuntimeError)
+                                {
+                                    Assert.Fail("Timeout waiting for data generation");
+                                }
                             }
                         }
                     }
                     else
                     {
                         _synchronizer.NewDataEvent.Wait(300);
-                    }
-
-                    if (currentTime.ConvertFromUtc(algorithmTimeZone) > endDate)
-                    {
-                        _feed.Exit();
-                        cancellationTokenSource.Cancel();
-                        break;
                     }
                 }
 
@@ -2655,19 +3378,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
 
                     lastTime = exchangeTime;
 
-                    var dataPoints = new List<BaseData>
-                    {
-                        new Tick
-                        {
-                            Symbol = Symbols.SPY,
-                            Time = exchangeTime,
-                            EndTime = exchangeTime,
-                            TickType = TickType.Trade,
-                            Value = 100,
-                            Quantity = 1
-                        }
-                    };
-
+                    var dataPoints = new List<BaseData>();
                     if (securityType == SecurityType.Option)
                     {
                         dataPoints.Add(new Tick
@@ -2679,9 +3390,32 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                             Value = 100,
                             Quantity = 1
                         });
+                        dataPoints.Add(new Tick
+                        {
+                            Symbol = canonicalOptionSymbol.Underlying,
+                            Time = exchangeTime,
+                            EndTime = exchangeTime,
+                            TickType = TickType.Trade,
+                            Value = 100,
+                            Quantity = 1
+                        });
+
+                        dataPoints.AddRange(
+                            optionSymbols.Select(
+                                symbol => new Tick
+                                {
+                                    Symbol = symbol,
+                                    Time = exchangeTime,
+                                    EndTime = exchangeTime,
+                                    TickType = TickType.Trade,
+                                    Value = 100,
+                                    Quantity = 1
+                                }));
                     }
 
-                    dataPoints.AddRange(
+                    if (securityType == SecurityType.Future)
+                    {
+                        dataPoints.AddRange(
                         futureSymbols.Select(
                             symbol => new Tick
                             {
@@ -2692,19 +3426,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                                 Value = 100,
                                 Quantity = 1
                             }));
-
-                    dataPoints.AddRange(
-                        optionSymbols.Select(
-                            symbol => new Tick
-                            {
-                                Symbol = symbol,
-                                Time = exchangeTime,
-                                EndTime = exchangeTime,
-                                TickType = TickType.Trade,
-                                Value = 100,
-                                Quantity = 1
-                            }));
-
+                    }
                     Log.Debug($"DQH: Emitting data point(s) at {utcTime.ConvertFromUtc(algorithmTimeZone)} ({algorithmTimeZone})");
 
                     return dataPoints;
@@ -2795,7 +3517,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
             mock.Setup(m => m.GetOpenOrders(It.IsAny<Func<Order, bool>>())).Returns(new List<Order>());
             algorithm.Transactions.SetOrderProcessor(mock.Object);
 
-            _synchronizer = new TestableLiveSynchronizer(timeProvider, 500);
+            _synchronizer = new TestableLiveSynchronizer(timeProvider, 10);
             _synchronizer.Initialize(algorithm, dataManager);
 
             if (securityType == SecurityType.Option)
@@ -2891,7 +3613,8 @@ namespace QuantConnect.Tests.Engine.DataFeeds
                 }
 
                 if (lastSecurityChangedTime != null &&
-                    timeSlice.Time > lastSecurityChangedTime.Value.Add(timeAdvanceStep))
+                    timeSlice.Time > lastSecurityChangedTime.Value.Add(timeAdvanceStep)
+                    && timeSlice.Slice.HasData)
                 {
                     if (securityType == SecurityType.Future)
                     {
@@ -2955,7 +3678,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
 
                 algorithm.OnEndOfTimeStep();
                 // We should wait for the base exchange to pick up the universe and push a selection data point
-                Thread.Sleep(100);
+                Thread.Sleep(50);
 
                 foreach (var baseDataCollection in timeSlice.UniverseData.Values)
                 {
@@ -2998,6 +3721,49 @@ namespace QuantConnect.Tests.Engine.DataFeeds
             timeAdvanced.DisposeSafely();
             started.DisposeSafely();
             timer.DisposeSafely();
+        }
+
+        private class TestFundamentalDataProviderTrue : IFundamentalDataProvider
+        {
+            public T Get<T>(DateTime time, SecurityIdentifier securityIdentifier, FundamentalProperty name)
+            {
+                if (securityIdentifier == SecurityIdentifier.Empty)
+                {
+                    return default;
+                }
+                return Get(time, securityIdentifier, name);
+            }
+
+            private dynamic Get(DateTime time, SecurityIdentifier securityIdentifier, FundamentalProperty enumName)
+            {
+                var name = Enum.GetName(enumName);
+                switch (name)
+                {
+                    case "HasFundamentalData":
+                        return true;
+                }
+                return null;
+            }
+            public void Initialize(IDataProvider dataProvider, bool liveMode)
+            {
+            }
+        }
+
+        private class ThrowingDataQueueHandler : IDataQueueHandler
+        {
+            public bool IsConnected => true;
+            public void Dispose()
+            { }
+            public void SetJob(LiveNodePacket job)
+            { }
+            public IEnumerator<BaseData> Subscribe(SubscriptionDataConfig dataConfig, EventHandler newDataAvailableHandler)
+            {
+                throw new NotImplementedException();
+            }
+            public void Unsubscribe(SubscriptionDataConfig dataConfig)
+            {
+                throw new NotImplementedException();
+            }
         }
     }
 
@@ -3053,7 +3819,7 @@ namespace QuantConnect.Tests.Engine.DataFeeds
         {
             NewDataEvent = new ManualResetEventSlim(true);
             _timeProvider = timeProvider ?? new RealTimeProvider();
-            _newLiveDataTimeout = newLiveDataTimeout ?? 500;
+            _newLiveDataTimeout = newLiveDataTimeout ?? 10;
         }
 
         protected override int GetPulseDueTime(DateTime now)

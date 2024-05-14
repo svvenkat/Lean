@@ -46,30 +46,33 @@ namespace QuantConnect.Algorithm.CSharp
         /// </summary>
         public Dictionary<string, string> ExpectedStatistics => new Dictionary<string, string>
         {
-            {"Total Trades", "13"},
+            {"Total Orders", "13"},
             {"Average Win", "0%"},
             {"Average Loss", "-0.14%"},
             {"Compounding Annual Return", "773.203%"},
             {"Drawdown", "3.300%"},
             {"Expectancy", "-1"},
+            {"Start Equity", "100000"},
+            {"End Equity", "103012.99"},
             {"Net Profit", "3.013%"},
-            {"Sharpe Ratio", "12.437"},
+            {"Sharpe Ratio", "12.422"},
+            {"Sortino Ratio", "0"},
             {"Probabilistic Sharpe Ratio", "62.198%"},
             {"Loss Rate", "100%"},
             {"Win Rate", "0%"},
             {"Profit-Loss Ratio", "0"},
-            {"Alpha", "1.941"},
+            {"Alpha", "1.949"},
             {"Beta", "2.094"},
             {"Annual Standard Deviation", "0.49"},
             {"Annual Variance", "0.24"},
             {"Information Ratio", "14.343"},
             {"Tracking Error", "0.287"},
-            {"Treynor Ratio", "2.91"},
+            {"Treynor Ratio", "2.906"},
             {"Total Fees", "$39.73"},
             {"Estimated Strategy Capacity", "$3100000.00"},
             {"Lowest Capacity Asset", "AIG R735QTJ8XC9X"},
             {"Portfolio Turnover", "52.21%"},
-            {"OrderListHash", "12425242f98844dc855c5c5e1dff9a6a"}
+            {"OrderListHash", "a18ad75219f800ac4435bfa4f750a67d"}
         };
     }
 }

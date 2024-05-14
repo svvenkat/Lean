@@ -26,7 +26,6 @@ using QuantConnect.Orders.Fills;
 using QuantConnect.Orders.Fees;
 using QuantConnect.Securities;
 using QuantConnect.Securities.Option;
-using QuantConnect.Securities.Positions;
 using QuantConnect.Util;
 
 namespace QuantConnect.Brokerages.Backtesting
@@ -328,7 +327,8 @@ namespace QuantConnect.Brokerages.Backtesting
                                     order,
                                     Algorithm.SubscriptionManager.SubscriptionDataConfigService,
                                     Algorithm.Settings.StalePriceTimeSpan,
-                                    securities);
+                                    securities,
+                                    OnOrderUpdated);
 
                                 // check if the fill should be emitted
                                 var fill = model.Fill(context);
@@ -348,7 +348,10 @@ namespace QuantConnect.Brokerages.Backtesting
                                     // TODO : This check can be removed in April, 2019 -- a 6-month window to upgrade (also, suspect small % of users, if any are impacted)
                                     if (fill.OrderFee.Value.Amount == 0m)
                                     {
-                                        fill.OrderFee = security.FeeModel.GetOrderFee(new OrderFeeParameters(security, order));
+                                        // It could be the case the order is a combo order, then it contains legs with different quantities and security types.
+                                        // Therefore, we need to compute the fees based on the specific leg order and security
+                                        var legKVP = securities.Where(x => x.Key.Id == fill.OrderId).Single();
+                                        fill.OrderFee = legKVP.Value.FeeModel.GetOrderFee(new OrderFeeParameters(legKVP.Value, legKVP.Key));
                                     }
                                 }
                             }
@@ -430,6 +433,23 @@ namespace QuantConnect.Brokerages.Backtesting
         }
 
         /// <summary>
+        /// Invokes the <see cref="Brokerage.OnOrderUpdated(OrderUpdateEvent)" /> event with the given order updates.
+        /// </summary>
+        private void OnOrderUpdated(Order order)
+        {
+            switch (order.Type)
+            {
+                case OrderType.TrailingStop:
+                    OnOrderUpdated(new OrderUpdateEvent { OrderId = order.Id, TrailingStopPrice = ((TrailingStopOrder)order).StopPrice });
+                    break;
+
+                case OrderType.StopLimit:
+                    OnOrderUpdated(new OrderUpdateEvent { OrderId = order.Id, StopTriggered = ((StopLimitOrder)order).StopTriggered });
+                    break;
+            }
+        }
+
+        /// <summary>
         /// Helper method to drive option assignment models
         /// </summary>
         private void ProcessAssignmentOrders()
@@ -446,12 +466,12 @@ namespace QuantConnect.Brokerages.Backtesting
                     var result = option.OptionAssignmentModel.GetAssignment(new OptionAssignmentParameters(option));
                     if (result != null && result.Quantity != 0)
                     {
-                        var request = new SubmitOrderRequest(OrderType.OptionExercise, option.Type, option.Symbol, Math.Abs(result.Quantity), 0m, 0m, 0m, Algorithm.UtcTime, result.Tag);
                         if (!_pendingOptionAssignments.Add(option.Symbol))
                         {
                             throw new InvalidOperationException($"Duplicate option exercise order request for symbol {option.Symbol}. Please contact support");
                         }
-                        Algorithm.Transactions.ProcessRequest(request);
+
+                        OnOptionNotification(new OptionNotificationEventArgs(option.Symbol, 0, result.Tag));
                     }
                 }
             }
@@ -525,10 +545,6 @@ namespace QuantConnect.Brokerages.Backtesting
                     // Any other type of delisting
                     OnDelistingNotification(new DelistingNotificationEventArgs(delisting.Symbol));
                 }
-
-                // don't allow users to open a new position once we sent the liquidation order
-                security.IsTradable = false;
-                security.IsDelisted = true;
 
                 // the subscription are getting removed from the data feed because they end
                 // remove security from all universes

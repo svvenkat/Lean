@@ -164,7 +164,7 @@ namespace QuantConnect.Algorithm.CSharp
         /// <summary>
         /// Data Points count of all timeslices of algorithm
         /// </summary>
-        public long DataPoints => 2973376;
+        public long DataPoints => 2940643;
 
         /// <summary>
         /// Data Points count of the algorithm history
@@ -176,30 +176,33 @@ namespace QuantConnect.Algorithm.CSharp
         /// </summary>
         public Dictionary<string, string> ExpectedStatistics => new Dictionary<string, string>
         {
-            {"Total Trades", "2"},
+            {"Total Orders", "2"},
             {"Average Win", "0%"},
             {"Average Loss", "-0.11%"},
-            {"Compounding Annual Return", "-2.852%"},
+            {"Compounding Annual Return", "-2.907%"},
             {"Drawdown", "0.300%"},
             {"Expectancy", "-1"},
-            {"Net Profit", "-0.061%"},
-            {"Sharpe Ratio", "-5.935"},
+            {"Start Equity", "1000000"},
+            {"End Equity", "999380.5"},
+            {"Net Profit", "-0.062%"},
+            {"Sharpe Ratio", "-8.624"},
+            {"Sortino Ratio", "0"},
             {"Probabilistic Sharpe Ratio", "0.982%"},
             {"Loss Rate", "100%"},
             {"Win Rate", "0%"},
             {"Profit-Loss Ratio", "0"},
-            {"Alpha", "-0.022"},
+            {"Alpha", "-0.032"},
             {"Beta", "0.007"},
             {"Annual Standard Deviation", "0.004"},
             {"Annual Variance", "0"},
-            {"Information Ratio", "-0.046"},
+            {"Information Ratio", "-0.051"},
             {"Tracking Error", "0.084"},
-            {"Treynor Ratio", "-3.26"},
-            {"Total Fees", "$7.50"},
+            {"Treynor Ratio", "-4.737"},
+            {"Total Fees", "$19.50"},
             {"Estimated Strategy Capacity", "$49000.00"},
             {"Lowest Capacity Asset", "GOOCV W78ZFMML01JA|GOOCV VP83T1ZUHROL"},
             {"Portfolio Turnover", "0.45%"},
-            {"OrderListHash", "8c49d2f91fd6736f968bc068f2cc188d"}
+            {"OrderListHash", "5d2df7cb88dbc63da13518c0195eea60"}
         };
     }
 }

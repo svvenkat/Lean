@@ -96,7 +96,7 @@ namespace QuantConnect.Algorithm.CSharp
                 Debug($"\nStatistics after fill:\n\t{statisticsStr}");
 
                 // Access a single statistic
-                Log($"Total trades so far: {statistics[PerformanceMetrics.TotalTrades]}");
+                Log($"Total trades so far: {statistics[PerformanceMetrics.TotalOrders]}");
                 Log($"Sharpe Ratio: {statistics[PerformanceMetrics.SharpeRatio]}");
 
                 // --------
@@ -198,30 +198,35 @@ namespace QuantConnect.Algorithm.CSharp
         /// </summary>
         public Dictionary<string, string> ExpectedStatistics => new Dictionary<string, string>
         {
-            {"Total Trades", "93"},
+            {"Total Orders", "94"},
             {"Average Win", "0.09%"},
             {"Average Loss", "-0.03%"},
             {"Compounding Annual Return", "18.903%"},
             {"Drawdown", "0.800%"},
             {"Expectancy", "0.135"},
+            {"Start Equity", "100000"},
+            {"End Equity", "100221.61"},
             {"Net Profit", "0.222%"},
-            {"Sharpe Ratio", "6.533"},
+            {"Sharpe Ratio", "6.406"},
+            {"Sortino Ratio", "0"},
             {"Probabilistic Sharpe Ratio", "69.072%"},
             {"Loss Rate", "70%"},
             {"Win Rate", "30%"},
             {"Profit-Loss Ratio", "2.73"},
-            {"Alpha", "-0.138"},
+            {"Alpha", "-0.144"},
             {"Beta", "0.264"},
             {"Annual Standard Deviation", "0.059"},
             {"Annual Variance", "0.003"},
             {"Information Ratio", "-9.751"},
             {"Tracking Error", "0.164"},
-            {"Treynor Ratio", "1.459"},
+            {"Treynor Ratio", "1.43"},
             {"Total Fees", "$114.39"},
             {"Estimated Strategy Capacity", "$1100000.00"},
             {"Lowest Capacity Asset", "IBM R735QTJ8XC9X"},
             {"Portfolio Turnover", "549.26%"},
-            {"OrderListHash", "8eba5008b53540153317baffe4083c6d"}
+            {"Most Traded Security Trade Count", "63"},
+            {"Most Traded Security", "IBM"},
+            {"OrderListHash", "8dd77e35338a81410a5b68dc8345f402"}
         };
     }
 }

@@ -64,7 +64,8 @@ namespace QuantConnect
         /// All securities added with <see cref="IAlgorithm.AddSecurity"/> are counted as one,
         /// with the exception of options and futures where every single contract in a chain counts as one.
         /// </remarks>
-        public int DataSubscriptionLimit { get; set; }
+        [Obsolete("This property is deprecated. Please observe data subscription limits set by your brokerage to avoid runtime errors.")]
+        public int DataSubscriptionLimit { get; set; } = int.MaxValue;
 
         /// <summary>
         /// Gets/sets the SetHoldings buffers value.
@@ -119,12 +120,23 @@ namespace QuantConnect
         }
 
         /// <summary>
+        /// Number of trading days per year for this Algorithm's portfolio statistics.
+        /// </summary>
+        /// <remarks>Effect on 
+        /// <see cref="Statistics.PortfolioStatistics.AnnualVariance"/>,
+        /// <seealso cref="Statistics.PortfolioStatistics.AnnualStandardDeviation"/>,
+        /// <seealso cref="Statistics.PortfolioStatistics.SharpeRatio"/>,
+        /// <seealso cref="Statistics.PortfolioStatistics.SortinoRatio"/>,
+        /// <seealso cref="Statistics.PortfolioStatistics.TrackingError"/>,
+        /// <seealso cref="Statistics.PortfolioStatistics.InformationRatio"/>.
+        /// </remarks>
+        public int? TradingDaysPerYear { get; set; }
+
+        /// <summary>
         /// Initializes a new instance of the <see cref="AlgorithmSettings"/> class
         /// </summary>
         public AlgorithmSettings()
         {
-            // default is unlimited
-            DataSubscriptionLimit = int.MaxValue;
             LiquidateEnabled = true;
             FreePortfolioValuePercentage = 0.0025m;
             // Because the free portfolio value has a trailing behavior by default, let's add a default minimum order margin portfolio percentage
